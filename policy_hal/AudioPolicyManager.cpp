@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2020 The Linux Foundation. All rights reserved.
  * Not a contribution.
  *
  * Copyright (C) 2009 The Android Open Source Project
@@ -471,7 +471,8 @@ void AudioPolicyManagerCustom::checkOutputForAttributes(const audio_attributes_t
         }
     }
 
-    if ((srcOutputs != dstOutputs) && isInvalidationOfMusicStreamNeeded(attr)) {
+    if ((srcOutputs != dstOutputs) && (oldDevices != newDevices) &&
+         isInvalidationOfMusicStreamNeeded(attr)) {
         AudioPolicyManager::checkOutputForAttributes(attr);
     }
 }
@@ -629,6 +630,10 @@ bool AudioPolicyManagerCustom::isOffloadSupported(const audio_offload_info_t& of
         return false;
     }
 
+    if (audio_is_linear_pcm(offloadInfo.format) &&
+           property_get_bool("vendor.audio.pcm.direct.disable", false /* default_value */)) {
+        return false;
+    }
     // See if there is a profile to support this.
     // AUDIO_DEVICE_NONE
     sp<IOProfile> profile = getProfileForOutput(DeviceVector() /*ignore device */,
@@ -993,7 +998,8 @@ void AudioPolicyManagerCustom::setForceUse(audio_policy_force_use_t usage,
     for (size_t i = mOutputs.size(); i > 0; i--) {
         sp<SwAudioOutputDescriptor> outputDesc = mOutputs.valueAt(i-1);
         DeviceVector newDevices = getNewOutputDevices(outputDesc, true /*fromCache*/);
-        if ((mEngine->getPhoneState() != AUDIO_MODE_IN_CALL) || (outputDesc != mPrimaryOutput)) {
+        if (outputDesc->isActive() && ((mEngine->getPhoneState() != AUDIO_MODE_IN_CALL) ||
+            (outputDesc != mPrimaryOutput))) {
             waitMs = setOutputDevices(outputDesc, newDevices, !newDevices.isEmpty(),
                                      delayMs);
 
@@ -1706,6 +1712,13 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevices(
         goto non_direct_output;
     }
 
+    if (property_get_bool("vendor.audio.pcm.direct.disable", false /* default_value */) &&
+                audio_is_linear_pcm(config->format)) {
+        ALOGD(":%s Force route mch pcm to deep buffer", __func__);
+        forced_deep = true;
+        goto non_direct_output;
+    }
+
     // Do not allow offloading if one non offloadable effect is enabled or MasterMono is enabled.
     // This prevents creating an offloaded track and tearing it down immediately after start
     // when audioflinger detects there is an active non offloadable effect.
@@ -1742,8 +1755,9 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevices(
         // if multiple concurrent offload decode is supported
         // do no check for reuse and also don't close previous output if its offload
         // previous output will be closed during track destruction
-        if (!mApmConfigs->isAudioMultipleOffloadEnable() &&
-                ((*flags & AUDIO_OUTPUT_FLAG_DIRECT) != 0)) {
+        if (!(mApmConfigs->isAudioMultipleOffloadEnable() &&
+                ((*flags & AUDIO_OUTPUT_FLAG_DIRECT) != 0) &&
+                ((*flags & AUDIO_OUTPUT_FLAG_MMAP_NOIRQ) == 0))) {
             for (size_t i = 0; i < mOutputs.size(); i++) {
                 sp<SwAudioOutputDescriptor> desc = mOutputs.valueAt(i);
                 if (!desc->isDuplicated() && (profile == desc->mProfile)) {
@@ -1751,7 +1765,7 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevices(
                     // reuse direct output if currently open by the same client
                     // and configured with same parameters
                     if ((config->sample_rate == desc->mSamplingRate) &&
-                        audio_formats_match(config->format, desc->mFormat) &&
+                        (config->format == desc->mFormat) &&
                         (channelMask == desc->mChannelMask) &&
                         (session == desc->mDirectClientSession)) {
                         desc->mDirectOpenCount++;
@@ -1788,8 +1802,7 @@ audio_io_handle_t AudioPolicyManagerCustom::getOutputForDevices(
         // only accept an output with the requested parameters
         if (status != NO_ERROR ||
             (config->sample_rate != 0 && config->sample_rate != outputDesc->mSamplingRate) ||
-            (config->format != AUDIO_FORMAT_DEFAULT &&
-                     !audio_formats_match(config->format, outputDesc->mFormat)) ||
+            (config->format != AUDIO_FORMAT_DEFAULT && config->format != outputDesc->mFormat) ||
             (channelMask != 0 && channelMask != outputDesc->mChannelMask)) {
             ALOGV("getOutputForDevice() failed opening direct output: output %d sample rate %d %d,"
                     "format %d %d, channel mask %04x %04x", output, config->sample_rate,
